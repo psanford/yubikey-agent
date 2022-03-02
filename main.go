@@ -19,11 +19,8 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -193,7 +190,7 @@ func (a *Agent) Close() error {
 
 func (a *Agent) getPIN() (string, error) {
 	if a.touchNotification != nil && a.touchNotification.Stop() {
-		defer a.touchNotification.Reset(5 * time.Second)
+		defer a.touchNotification.Reset(notificationDelay)
 	}
 	r, _ := a.yk.Retries()
 	return getPIN(a.serial, r)
@@ -287,7 +284,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		a.touchNotification = time.NewTimer(5 * time.Second)
+		a.touchNotification = time.NewTimer(notificationDelay)
 		go func() {
 			select {
 			case <-a.touchNotification.C:
@@ -295,7 +292,10 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 				a.touchNotification.Stop()
 				return
 			}
-			showNotification("Waiting for YubiKey touch...")
+			clearNotification := showNotification("Waiting for YubiKey touch...")
+
+			<-ctx.Done()
+			clearNotification()
 		}()
 
 		alg := key.Type()
@@ -309,18 +309,6 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 		return s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
 	}
 	return nil, fmt.Errorf("no private keys match the requested public key")
-}
-
-func showNotification(message string) {
-	switch runtime.GOOS {
-	case "darwin":
-		message = strings.ReplaceAll(message, `\`, `\\`)
-		message = strings.ReplaceAll(message, `"`, `\"`)
-		appleScript := `display notification "%s" with title "yubikey-agent"`
-		exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
-	case "linux":
-		exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
-	}
 }
 
 func (a *Agent) Extension(extensionType string, contents []byte) ([]byte, error) {
