@@ -21,14 +21,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/go-piv/piv-go/piv"
+	"github.com/prometheus/procfs"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -78,7 +81,7 @@ func runAgent(socketPath string) {
 		log.Println("Consider using the launchd or systemd services.")
 	}
 
-	a := &Agent{}
+	a := &AgentManager{}
 
 	c := make(chan os.Signal)
 	signal.Notify(c, syscall.SIGHUP)
@@ -110,11 +113,12 @@ func runAgent(socketPath string) {
 			}
 			log.Fatalln("Failed to accept connections:", err)
 		}
+
 		go a.serveConn(c)
 	}
 }
 
-type Agent struct {
+type AgentManager struct {
 	mu     sync.Mutex
 	yk     *piv.YubiKey
 	serial uint32
@@ -125,10 +129,49 @@ type Agent struct {
 	touchNotification *time.Timer
 }
 
+type Agent struct {
+	manager *AgentManager
+	pid     int
+	cmd     string
+}
+
 var _ agent.ExtendedAgent = &Agent{}
 
-func (a *Agent) serveConn(c net.Conn) {
-	if err := agent.ServeAgent(a, c); err != io.EOF {
+func (m *AgentManager) serveConn(c net.Conn) {
+	unixConn := c.(*net.UnixConn)
+	rawConn, err := unixConn.SyscallConn()
+	if err != nil {
+		log.Fatalf("Agent failed to get raw unix conn: %s", err)
+	}
+	var ucred *unix.Ucred
+	err = rawConn.Control(func(fd uintptr) {
+		ucred, err = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	})
+	if err != nil {
+		log.Fatalf("Failed to get ucred from unix socket: %s", err)
+	}
+	if ucred == nil {
+		log.Fatalf("Ucred from unix socket is nil")
+	}
+
+	a := Agent{
+		manager: m,
+		pid:     int(ucred.Pid),
+	}
+
+	proc, err := procfs.NewProc(int(ucred.Pid))
+	if err != nil {
+		log.Printf("Failed to get proc info for pid: %d, %s", ucred.Pid, err)
+	} else {
+		cmd, err := proc.CmdLine()
+		if err != nil {
+			log.Printf("Failed to get cmdline for pid: %d, %s", ucred.Pid, err)
+		} else {
+			a.cmd = strings.Join(cmd, " ")
+		}
+	}
+
+	if err := agent.ServeAgent(&a, c); err != io.EOF {
 		log.Println("Agent client connection ended with error:", err)
 	}
 }
@@ -140,7 +183,7 @@ func healthy(yk *piv.YubiKey) bool {
 	return err == nil
 }
 
-func (a *Agent) ensureYK() error {
+func (a *AgentManager) ensureYK() error {
 	if a.yk == nil || !healthy(a.yk) {
 		if a.yk != nil {
 			log.Println("Reconnecting to the YubiKey...")
@@ -157,7 +200,7 @@ func (a *Agent) ensureYK() error {
 	return nil
 }
 
-func (a *Agent) connectToYK() (*piv.YubiKey, error) {
+func (a *AgentManager) connectToYK() (*piv.YubiKey, error) {
 	cards, err := piv.Cards()
 	if err != nil {
 		return nil, err
@@ -176,7 +219,7 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 	return yk, nil
 }
 
-func (a *Agent) Close() error {
+func (a *AgentManager) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.yk != nil {
@@ -188,7 +231,7 @@ func (a *Agent) Close() error {
 	return nil
 }
 
-func (a *Agent) getPIN() (string, error) {
+func (a *AgentManager) getPIN() (string, error) {
 	if a.touchNotification != nil && a.touchNotification.Stop() {
 		defer a.touchNotification.Reset(notificationDelay)
 	}
@@ -197,20 +240,20 @@ func (a *Agent) getPIN() (string, error) {
 }
 
 func (a *Agent) List() ([]*agent.Key, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.ensureYK(); err != nil {
+	a.manager.mu.Lock()
+	defer a.manager.mu.Unlock()
+	if err := a.manager.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
 
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.manager.yk, piv.SlotAuthentication)
 	if err != nil {
 		return nil, err
 	}
 	return []*agent.Key{{
 		Format:  pk.Type(),
 		Blob:    pk.Marshal(),
-		Comment: fmt.Sprintf("YubiKey #%d PIV Slot 9a", a.serial),
+		Comment: fmt.Sprintf("YubiKey #%d PIV Slot 9a", a.manager.serial),
 	}}, nil
 }
 
@@ -233,9 +276,9 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 }
 
 func (a *Agent) Signers() ([]ssh.Signer, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.ensureYK(); err != nil {
+	a.manager.mu.Lock()
+	defer a.manager.mu.Unlock()
+	if err := a.manager.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
 
@@ -243,14 +286,14 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 }
 
 func (a *Agent) signers() ([]ssh.Signer, error) {
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.manager.yk, piv.SlotAuthentication)
 	if err != nil {
 		return nil, err
 	}
-	priv, err := a.yk.PrivateKey(
+	priv, err := a.manager.yk.PrivateKey(
 		piv.SlotAuthentication,
 		pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
-		piv.KeyAuth{PINPrompt: a.getPIN},
+		piv.KeyAuth{PINPrompt: a.manager.getPIN},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare private key: %w", err)
@@ -267,9 +310,9 @@ func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 }
 
 func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.ensureYK(); err != nil {
+	a.manager.mu.Lock()
+	defer a.manager.mu.Unlock()
+	if err := a.manager.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
 
@@ -284,15 +327,16 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		a.touchNotification = time.NewTimer(notificationDelay)
+		a.manager.touchNotification = time.NewTimer(notificationDelay)
 		go func() {
 			select {
-			case <-a.touchNotification.C:
+			case <-a.manager.touchNotification.C:
 			case <-ctx.Done():
-				a.touchNotification.Stop()
+				a.manager.touchNotification.Stop()
 				return
 			}
-			clearNotification := showNotification("Waiting for YubiKey touch...")
+			msg := fmt.Sprintf("Waiting for YubiKey touch for\n<%s>", a.cmd)
+			clearNotification := showNotification(msg)
 
 			<-ctx.Done()
 			clearNotification()
