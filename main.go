@@ -335,7 +335,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 				a.manager.touchNotification.Stop()
 				return
 			}
-			msg := fmt.Sprintf("Waiting for YubiKey touch for\n<%s>", a.cmd)
+			msg := fmt.Sprintf("Waiting for YubiKey touch for\n%s", a.cmd)
 			clearNotification := showNotification(msg)
 
 			<-ctx.Done()
